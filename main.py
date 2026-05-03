@@ -8,9 +8,10 @@ import os
 import json
 import asyncio
 import logging
+import re
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -19,12 +20,12 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import google.generativeai as genai
 import httpx
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
-__version__ = "1.0.0"
+__version__ = "2.1.0"
 __author__ = "Lokesh Dasari"
 
 logging.basicConfig(
@@ -33,16 +34,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Rate limiter — prevents API abuse
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="VoteGuide AI",
-    description="AI-powered election process education assistant using Google Gemini",
+    description="AI-powered election process education assistant using Google Gemini 2.0 Flash",
     version=__version__,
 )
 
-# CORS — allow all origins for hackathon demo
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,16 +55,23 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 templates = Jinja2Templates(directory="templates")
 
-# Primary AI: Google Gemini 2.0 Flash
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
 
-# Fallback AI: Groq via raw HTTP (avoids library version conflicts on Cloud Run)
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL: str = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL: str = "llama-3.3-70b-versatile"
 GEMINI_MODEL: str = "gemini-2.0-flash"
 
-# Country-specific official election data
+# HTML sanitization — strip tags from user input before embedding in prompts
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def sanitize_text(text: str) -> str:
+    """Strip HTML tags to prevent prompt injection via markup."""
+    return _TAG_RE.sub("", text).strip()
+
+
 COUNTRY_CONTEXTS: dict = {
     "India": {
         "body": "Election Commission of India (ECI)",
@@ -134,18 +140,20 @@ Want to know how to find your exact polling station once you are registered?"""
 class ChatRequest(BaseModel):
     """Request model for the chat streaming endpoint."""
 
-    country: str
+    country: str = "India"
     message: str
     history: list = []
 
-    @validator("country")
+    @field_validator("country", mode="before")
+    @classmethod
     def validate_country(cls, v: str) -> str:
         """Validate country is supported, fall back to India."""
         if v not in COUNTRY_CONTEXTS:
             return "India"
         return v
 
-    @validator("message")
+    @field_validator("message", mode="before")
+    @classmethod
     def validate_message(cls, v: str) -> str:
         """Validate message is non-empty and within length limit."""
         if not v or not v.strip():
@@ -154,49 +162,63 @@ class ChatRequest(BaseModel):
             raise ValueError("Message too long — maximum 1000 characters")
         return v.strip()
 
+    @field_validator("history", mode="before")
+    @classmethod
+    def validate_history(cls, v: list) -> list:
+        """Limit history length to prevent context overflow."""
+        if len(v) > 20:
+            return v[-20:]
+        return v
+
 
 async def stream_gemini(
     system_prompt: str,
     history: list,
-    message: str
+    message: str,
 ) -> AsyncGenerator[str, None]:
     """
     Stream response from Google Gemini 2.0 Flash.
-    Primary AI provider — validated by Google judges.
+    Primary AI provider.
+    Uses asyncio.to_thread to prevent blocking the event loop since the
+    google-generativeai SDK exposes a synchronous streaming iterator.
     """
     model = genai.GenerativeModel(
         model_name=GEMINI_MODEL,
-        system_instruction=system_prompt
+        system_instruction=system_prompt,
     )
     gemini_history = [
         {
             "role": "model" if h["role"] == "assistant" else h["role"],
-            "parts": [h["content"]]
+            "parts": [sanitize_text(h["content"])],
         }
         for h in history
     ]
     chat = model.start_chat(history=gemini_history)
-    response = chat.send_message(message, stream=True)
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+
+    # Collect all chunks in a thread so the sync SDK does not block the event loop
+    def _collect_chunks() -> list[str]:
+        response = chat.send_message(sanitize_text(message), stream=True)
+        return [chunk.text for chunk in response if chunk.text]
+
+    chunks = await asyncio.to_thread(_collect_chunks)
+    for text in chunks:
+        yield text
 
 
 async def stream_groq(
     system_prompt: str,
     history: list,
-    message: str
+    message: str,
 ) -> AsyncGenerator[str, None]:
     """
     Stream response from Groq Llama 3.3 70B via raw HTTP.
     Fallback provider — activates only when Gemini quota is exceeded.
-    Uses httpx directly to avoid library version conflicts on Cloud Run.
     """
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
         role = "assistant" if h["role"] in ("model", "assistant") else "user"
-        messages.append({"role": role, "content": h["content"]})
-    messages.append({"role": "user", "content": message})
+        messages.append({"role": role, "content": sanitize_text(h["content"])})
+    messages.append({"role": "user", "content": sanitize_text(message)})
 
     async with httpx.AsyncClient(timeout=60) as client:
         async with client.stream(
@@ -228,10 +250,11 @@ async def stream_groq(
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request) -> HTMLResponse:
     """Serve the main VoteGuide AI chat interface."""
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "countries": list(COUNTRY_CONTEXTS.keys()),
-    })
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"countries": list(COUNTRY_CONTEXTS.keys())},
+    )
 
 
 @app.post("/chat/stream")
@@ -244,19 +267,18 @@ async def chat_stream(request: Request, req: ChatRequest) -> StreamingResponse:
     """
     ctx = COUNTRY_CONTEXTS.get(req.country, COUNTRY_CONTEXTS["India"])
     system_prompt = SYSTEM_PROMPT.format(country=req.country, **ctx)
-    logger.info("Chat request — country: %s, message_length: %d", req.country, len(req.message))
+    logger.info("Chat request — country: %s, length: %d", req.country, len(req.message))
 
     async def generate() -> AsyncGenerator[bytes, None]:
         provider = "gemini"
         try:
             async for text in stream_gemini(system_prompt, req.history, req.message):
-                yield f"data: {json.dumps({'text': text, 'done': False, 'provider': 'gemini'})}\n\n"
+                yield f"data: {json.dumps({'text': text, 'done': False, 'provider': 'gemini'})}\n\n".encode()
                 await asyncio.sleep(0)
 
         except Exception as gemini_error:
             err = str(gemini_error)
             logger.warning("Gemini error: %s", err[:120])
-
             is_quota_error = any(k in err for k in ["429", "quota", "rate", "RESOURCE_EXHAUSTED"])
 
             if is_quota_error and GROQ_API_KEY:
@@ -264,25 +286,28 @@ async def chat_stream(request: Request, req: ChatRequest) -> StreamingResponse:
                 logger.info("Quota exceeded — switching to Groq fallback")
                 try:
                     async for text in stream_groq(system_prompt, req.history, req.message):
-                        yield f"data: {json.dumps({'text': text, 'done': False, 'provider': 'groq'})}\n\n"
+                        yield f"data: {json.dumps({'text': text, 'done': False, 'provider': 'groq'})}\n\n".encode()
                         await asyncio.sleep(0)
                 except Exception as groq_error:
                     logger.error("Groq fallback failed: %s", str(groq_error))
                     msg = "Both AI providers are temporarily unavailable. Please try again in a few minutes."
-                    yield f"data: {json.dumps({'text': msg, 'done': True})}\n\n"
+                    yield f"data: {json.dumps({'text': msg, 'done': True})}\n\n".encode()
                     return
             else:
-                logger.error("Non-quota Gemini error: %s", err)
                 msg = "AI assistant temporarily unavailable. Please try again shortly."
-                yield f"data: {json.dumps({'text': msg, 'done': True})}\n\n"
+                yield f"data: {json.dumps({'text': msg, 'done': True})}\n\n".encode()
                 return
 
-        yield f"data: {json.dumps({'text': '', 'done': True, 'provider': provider})}\n\n"
+        yield f"data: {json.dumps({'text': '', 'done': True, 'provider': provider})}\n\n".encode()
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -301,4 +326,9 @@ async def health() -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        log_level="info",
+    )

@@ -2,7 +2,7 @@
 ### Election Process Education Assistant — PromptWars Virtual Challenge 2
 
 **Live Demo:** [Your Cloud Run URL here]  
-**Built with:** Gemini 1.5 Flash · FastAPI · Google Cloud Run
+**Built with:** Gemini 2.0 Flash · FastAPI · Google Cloud Run
 
 ---
 
@@ -80,7 +80,7 @@ Google Cloud Run (asia-south1)
     │     ├── POST /chat/stream → Server-Sent Events (streaming)
     │     └── GET  /health    → Health check
     │
-    └── Gemini 1.5 Flash API
+    └── Gemini 2.0 Flash API
           └── System prompt + conversation history
 ```
 
